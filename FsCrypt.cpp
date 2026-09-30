@@ -396,10 +396,19 @@ static bool prepare_dir(const std::string& dir, mode_t mode, uid_t uid, gid_t gi
 
 // Prepare a directory and assign it the given encryption policy.
 static bool prepare_dir_with_policy(const std::string& dir, mode_t mode, uid_t uid, gid_t gid,
-                                    const EncryptionPolicy& policy) {
+                                    const EncryptionPolicy& policy,
+                                    bool allow_nonempty_without_policy = false) {
     if (android::vold::pathExists(dir)) {
         if (!prepare_dir(dir, mode, uid, gid)) return false;
-        if (IsFbeEnabled() && !EnsurePolicy(policy, dir)) return false;
+        if (IsFbeEnabled() && !EnsurePolicy(policy, dir)) {
+            const int policy_errno = errno;
+            if (allow_nonempty_without_policy && policy_errno == ENOTEMPTY) {
+                LOG(WARNING) << "AERA: continuing with populated media directory " << dir
+                             << " after its missing fscrypt policy could not be applied";
+            } else {
+                return false;
+            }
+        }
     } else {
         // If the directory does not yet exist, then create it under a temporary name, and only move
         // it to the final name after it is fully prepared with an encryption policy and the desired
@@ -1057,7 +1066,17 @@ bool fscrypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_
             if (!prepare_dir_with_policy(vendor_ce_path, 0771, AID_ROOT, AID_ROOT, ce_policy))
                 return false;
         }
-        if (!prepare_dir_with_policy(media_ce_path, 02770, AID_MEDIA_RW, AID_MEDIA_RW, ce_policy))
+        // Some vendor/ROM combinations leave the primary user's existing media
+        // directory populated without a policy on the directory itself.  Once
+        // the CE key is installed the contents are readable, but the normal
+        // policy setup fails with ENOTEMPTY and prevents recovery from doing
+        // its post-decrypt /sdcard and MTP hand-off.  Keep this compatibility
+        // path opt-in and restricted to internal user-0 media.
+        const bool allow_nonempty_media =
+                volume_uuid.empty() && user_id == 0 &&
+                android::base::GetBoolProperty("ro.aera.allow_nonempty_media", false);
+        if (!prepare_dir_with_policy(media_ce_path, 02770, AID_MEDIA_RW, AID_MEDIA_RW, ce_policy,
+                                     allow_nonempty_media))
             return false;
         // On devices without sdcardfs (kernel 5.4+), the path permissions aren't fixed
         // up automatically; therefore, use a default ACL, to ensure apps with MEDIA_RW
