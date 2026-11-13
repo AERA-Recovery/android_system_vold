@@ -603,7 +603,44 @@ install:
     return true;
 }
 
+static bool preserve_existing_legacy_layout() {
+    return android::base::GetBoolProperty("ro.aera.crypto.legacy_layout", false);
+}
+
+static bool legacy_user0_alias_valid() {
+    std::string target;
+    struct stat st;
+    if (lstat(data_data_dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) ||
+        !android::base::Readlink(data_user_0_dir, &target) || target != data_data_dir) {
+        LOG(ERROR) << "Legacy user-0 data layout is missing or inconsistent";
+        return false;
+    }
+    return true;
+}
+
+static bool check_existing_legacy_storage(int flags) {
+    if (!legacy_user0_alias_valid()) return false;
+    std::vector<std::string> paths;
+    const std::string root = DATA_MNT_POINT;
+    if (flags & android::os::IVold::STORAGE_FLAG_DE) {
+        paths.insert(paths.end(), {root + "/system_de/0", root + "/misc_de/0", root + "/user_de/0"});
+    }
+    if (flags & android::os::IVold::STORAGE_FLAG_CE) {
+        paths.insert(paths.end(), {root + "/system_ce/0", root + "/misc_ce/0", root + "/media/0"});
+    }
+    for (const auto& path : paths) {
+        struct stat st;
+        if (lstat(path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+            LOG(ERROR) << "Required legacy storage directory is missing: " << path;
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool prepare_special_dirs() {
+    if (preserve_existing_legacy_layout()) return legacy_user0_alias_valid();
+
     // Ensure that /data/data and its "alias" /data/user/0 exist, and create the
     // bind mount of /data/data onto /data/user/0.  This *should* happen in
     // fscrypt_prepare_user_storage().  However, it actually must be done early,
@@ -969,6 +1006,15 @@ static bool prepare_subdirs(const std::string& action, const std::string& volume
 bool fscrypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_id, int flags) {
     LOG(INFO) << "fscrypt_prepare_user_storage for volume " << escape_empty(volume_uuid)
                << ", user " << user_id << ", flags " << flags;
+
+    if (preserve_existing_legacy_layout()) {
+        if (!volume_uuid.empty() || user_id != 0) {
+            LOG(ERROR) << "Legacy recovery storage setup supports internal user 0 only";
+            return false;
+        }
+        // Preserve the installed system's directory layout and labels during unlock.
+        return check_existing_legacy_storage(flags);
+    }
 
     // Internal storage must be prepared before adoptable storage, since the
     // user's volume keys are stored in their internal storage.
